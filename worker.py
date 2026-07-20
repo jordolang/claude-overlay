@@ -97,10 +97,16 @@ class ClaudeWorker(threading.Thread):
         # session STARTS in bypass mode. Re-derived on every _open() (a reconnect that
         # happens while read-only relaunches without the flag).
         self._bypass_capable = (self._permission_mode == "bypassPermissions")
+        # When set, the next (re)connect resumes this prior session id (loads its history
+        # server-side) instead of starting blank. Set by resume(), cleared by reset() so a
+        # "New conversation" truly starts fresh. Kept set across reconnects so a hiccup
+        # resumes the same conversation rather than dropping it.
+        self._resume_id = None
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
     def reset(self):                  self.req.put(("reset", None))
+    def resume(self, session_id):     self.req.put(("resume", session_id))
     def compact(self):                self.req.put(("compact", None))
     def shutdown(self):
         self._running = False
@@ -242,6 +248,11 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        if self._resume_id:
+            # Resume a prior session: the CLI reloads its full conversation history so the
+            # continued turns keep the old context. Dropped gracefully below on an SDK too
+            # old to accept it (the overlay still opens, just without resume).
+            opts["resume"] = self._resume_id
         if DISALLOWED_TOOLS:
             # Remove interactive tools the overlay can't service (AskUserQuestion) from the
             # tool schema entirely, so the model can't call them and hang the turn — it asks
@@ -264,7 +275,7 @@ class ClaudeWorker(threading.Thread):
         # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
         # loads (with reduced features) instead of failing to construct options at all.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
-                     "include_partial_messages", "skills", "disallowed_tools"]
+                     "include_partial_messages", "skills", "disallowed_tools", "resume"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
@@ -339,10 +350,17 @@ class ClaudeWorker(threading.Thread):
             # reconnect and keep serving.
             try:
                 if kind == "reset":
+                    self._resume_id = None          # New conversation → forget any resumed session
                     await self._close()
                     self._saw_stream = False
                     await self._open()
                     self.ui.put(("reset_done", None))
+                elif kind == "resume":
+                    self._resume_id = payload or None   # load this prior session's history on connect
+                    await self._close()
+                    self._saw_stream = False
+                    await self._open()
+                    self.ui.put(("resumed", self._resume_id))
                 elif kind == "ask":
                     await self._run_turn(payload)
                 elif kind == "compact":

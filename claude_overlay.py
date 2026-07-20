@@ -37,6 +37,19 @@ from win32utils import *
 from win32utils import _user32, _gdi32
 from worker import ClaudeWorker
 
+# Tk cursor names are platform-specific: the Win32/X11 resize-cursor names used by the
+# frameless window's edge grips ("size_ns", "size_we", "size_nw_se", "size_ne_sw") are
+# NOT recognized by macOS's Aqua Tk — it raises TclError and aborts widget creation.
+# Map them to Aqua's native resize cursors off Windows; pass them through unchanged on
+# Windows so its appearance is identical. ("sizing"/"hand2"/"arrow" are valid everywhere.)
+MAC = sys.platform == "darwin"
+_MAC_CURSORS = {
+    "size_ns": "resizeupdown", "size_we": "resizeleftright",
+    "size_nw_se": "resizebottomright", "size_ne_sw": "resizebottomleft",
+}
+def _cursor(name):
+    return name if sys.platform == "win32" else _MAC_CURSORS.get(name, name)
+
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Reply to Claude…"
 TOOL_ICONS = {
@@ -205,11 +218,163 @@ class Overlay:
         self._compact_frame = 0
 
         self._build()
+        self._setup_mac_app()
         self._register_hotkey()
         self.root.after(60, self._poll)
 
     def px(self, v):
         return int(round(v * self.s))
+
+    def _setup_mac_app(self):
+        """macOS only: make the overlay quit like a normal Mac app. Route the standard Quit
+        Apple event — ⌘Q and the Dock icon's right-click → Quit — to our clean teardown, and
+        give the Dock tile the Clawd icon instead of the generic 'Python' one. Best-effort:
+        never raises, so a missing icon / older Tk just leaves the defaults in place. On
+        Windows this is a no-op (the taskbar button + ✕ already cover it)."""
+        if sys.platform != "darwin":
+            return
+        try:
+            # ⌘Q and Dock → Quit both fire tk::mac::Quit; send them through quit() so the
+            # worker/agent shuts down cleanly rather than the interpreter being killed outright.
+            self.root.createcommand("tk::mac::Quit", self.quit)
+        except Exception:
+            pass
+        try:
+            from AppKit import NSApplication, NSImage
+            png = Path(__file__).with_name("claude_overlay_2.png")
+            if png.exists():
+                img = NSImage.alloc().initByReferencingFile_(str(png))
+                if img is not None:
+                    NSApplication.sharedApplication().setApplicationIconImage_(img)
+        except Exception:
+            pass
+        try:
+            # THE typing fix. A GUI process spawned directly by launchd (our login item) comes
+            # up OUTSIDE the normal Aqua foreground context, so it can start as an Accessory /
+            # Prohibited app that can never become the *active* application — its -topmost window
+            # still floats on top and receives mouse clicks, but Cocoa never routes keystrokes to
+            # a window whose owning app isn't active, so the text box looks dead. activate() /
+            # activateIgnoringOtherApps: are no-ops until the process is a Regular app, so promote
+            # it explicitly here (0 == NSApplicationActivationPolicyRegular). Idempotent + safe.
+            NSApplication.sharedApplication().setActivationPolicy_(0)
+        except Exception:
+            pass
+        try:
+            # A borderless window doesn't activate its app when clicked on macOS, and the
+            # overlay is launched detached (login item) so its app is never frontmost — which
+            # means keystrokes go to whatever app IS frontmost, and the text box seems "dead".
+            # Activate the overlay on ANY click so what you type actually lands in it.
+            self.root.bind_all("<Button-1>", self._mac_on_click, add="+")
+        except Exception:
+            pass
+        # Come to the front shortly after launch so the overlay is immediately ready to type in.
+        # A single deferred pass is enough now that _mac_activate repairs key-window status and
+        # makes the window key; earlier startup churn (taskbar-button nudge, first <Map>) has
+        # settled by 300 ms.
+        self.root.after(300, lambda: self._mac_activate(focus_entry=True))
+
+    def _ns_window(self):
+        """macOS: return the NSWindow backing our main Tk window, or None. Matched by title
+        (Tk keeps the NSWindow title even under overrideredirect) among the app's visible,
+        key-capable windows — so we skip Tk's hidden helper window and any child dialogs."""
+        try:
+            from AppKit import NSApp
+            want = self.root.title()
+            for w in NSApp().windows():
+                try:
+                    if w.isVisible() and w.title() == want and w.canBecomeKeyWindow():
+                        return w
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _mac_ensure_keyable(self):
+        """macOS: guarantee the frameless window can become the KEY window (the one Cocoa
+        routes keystrokes to). On this Tk build, deiconify() and re-asserting overrideredirect
+        both strip the NSWindow's title bit, after which canBecomeKeyWindow returns NO and the
+        text box goes dead — the whole 'can't type' bug. When we detect that broken state,
+        ::tk::unsupported::MacWindowStyle 'document'+'noTitleBar' restores canBecomeKeyWindow=YES
+        while keeping the window borderless (verified), then we re-assert topmost. Pure Tk — no
+        pyobjc setStyleMask, which hangs this app's run loop (a known dead end). Only acts when
+        actually broken, so it doesn't churn the window on every activation."""
+        if sys.platform != "darwin":
+            return
+        try:
+            from AppKit import NSApp
+            want = self.root.title()
+            broken = any(
+                (w.isVisible() and w.title() == want and not w.canBecomeKeyWindow())
+                for w in NSApp().windows())
+            if not broken:
+                return
+            self.root.overrideredirect(False)
+            self.root.tk.call("::tk::unsupported::MacWindowStyle", "style",
+                              self.root._w, "document", "noTitleBar")
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+
+    def _frameless_reassert(self):
+        """Re-assert the frameless overlay after a deiconify/restore (taskbar restore, hotkey
+        show, the withdraw→deiconify around a screenshot). Windows: re-apply overrideredirect,
+        since a deiconify re-adds the title bar there. macOS: re-applying overrideredirect
+        instead STRIPS the NSWindow title bit and the window can no longer become key → the
+        text box stops accepting input; so route through the mac activation path, which repairs
+        key-window ability (_mac_ensure_keyable) and re-focuses the input instead."""
+        if sys.platform == "darwin":
+            self._mac_activate(focus_entry=True)
+            return
+        try:
+            self.root.overrideredirect(True)
+        except Exception:
+            pass
+
+    def _mac_on_click(self, e=None):
+        # Activate the app and repair/assert key-window status so what you type lands in the
+        # overlay — a borderless window doesn't activate its (detached, launchd-launched) app on
+        # its own when clicked.
+        self._mac_activate()
+
+    def _mac_activate(self, focus_entry=False):
+        """macOS: bring THIS app to the foreground so keystrokes route to the overlay's text
+        box. Needed because the overlay is a borderless window launched detached, so its app
+        won't become active on its own and clicking a borderless window doesn't activate it.
+        No-op on other platforms (Windows handles activation via _force_foreground)."""
+        if sys.platform != "darwin":
+            return
+        try:
+            from AppKit import NSApplication
+            app = NSApplication.sharedApplication()
+            # macOS 14+ deprecated activateIgnoringOtherApps: and prefers -activate. Try the
+            # modern one first, then the legacy call, so activation works across OS versions.
+            try:
+                app.activate()
+            except Exception:
+                pass
+            try:
+                app.activateIgnoringOtherApps_(True)
+            except Exception:
+                pass
+            # Being the ACTIVE app is not enough: macOS delivers keystrokes only to the *key*
+            # window, and our -topmost borderless window never auto-becomes key (Tk's focus_set
+            # is Tk-level only and never calls Cocoa's makeKeyWindow — diagnostics showed
+            # active=True but key=None, i.e. no window owned the keyboard → dead text box). Make
+            # our window key explicitly. Ordering-only call, so it's clear of the setStyleMask
+            # relayout that hangs this Tk build.
+            self._mac_ensure_keyable()   # repair a stripped title bit BEFORE trying to become key
+            try:
+                w = self._ns_window()
+                if w is not None:
+                    w.makeKeyAndOrderFront_(None)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Always pull keyboard focus to the input box after activating — clicking the frameless
+        # window otherwise leaves focus wherever it was, so typing appears to do nothing.
+        self.root.after(1, self._safe_focus_entry)
 
     # ── construction ──
     def _build(self):
@@ -281,7 +446,7 @@ class Overlay:
                          "⚡ Full access restored from your last session (you had "
                          "switched Read-only off). Flip it back on any time.")
 
-        self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self.root.after(130, self._initial_focus)
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
@@ -291,6 +456,16 @@ class Overlay:
         self.root.after(1200, self._check_for_update)
         self.root.after(1500, self._check_cli_update)
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _initial_focus(self):
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+        try:
+            self.entry.focus_set()
+        except Exception:
+            pass
 
     def _start_hang_watchdog(self):
         """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
@@ -464,7 +639,7 @@ class Overlay:
     def _after_taskbar_show(self, geo=None):
         try:
             self.root.deiconify()
-            self.root.overrideredirect(True)        # deiconify can re-add decorations → strip them
+            self._frameless_reassert()              # deiconify can re-add decorations → strip them
             if geo:
                 self.root.geometry(geo)
             self.root.attributes("-topmost", True)
@@ -483,7 +658,7 @@ class Overlay:
             return
         self._mapping = True
         try:
-            self.root.overrideredirect(True)
+            self._frameless_reassert()
             self.root.attributes("-topmost", True)
             self._set_taskbar_button()
             self.root.after(20, self._apply_region)
@@ -904,7 +1079,7 @@ class Overlay:
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
         self.attach_lbl.bind("<Button-1>", lambda e: self._clear_attachments())
         self.grip = tk.Label(st, text="◢", bg=T["bg"], fg=T["faint"], font=self.f_small,
-                             cursor="size_nw_se")
+                             cursor=_cursor("size_nw_se"))
         self.grip.pack(side="right", padx=(0, self.px(8)), pady=pad)
         self.grip.bind("<ButtonPress-1>", self._resize_start)
         self.grip.bind("<B1-Motion>", self._resize_move)
@@ -1325,6 +1500,9 @@ class Overlay:
                     activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
         for lbl, cmd in self._gear_items():
             m.add_command(label=lbl, command=cmd)
+        m.add_separator()
+        m.add_command(label="＋  New conversation", command=self.reset)
+        m.add_command(label="🕘  Load conversation…", command=self._open_conv_picker)
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
@@ -1576,7 +1754,7 @@ class Overlay:
         ]
         self._edge_widgets = []
         for place_kw, dirs, cur in edges:
-            f = tk.Frame(self.root, bg=T["bg"], cursor=cur)
+            f = tk.Frame(self.root, bg=T["bg"], cursor=_cursor(cur))
             f.place(**place_kw)
             f.bind("<ButtonPress-1>", lambda e, d=dirs: self._edge_resize_start(e, d))
             f.bind("<B1-Motion>", self._edge_resize_move)
@@ -2947,7 +3125,7 @@ class Overlay:
         finally:
             if do_hide:
                 self.root.deiconify()
-                self.root.overrideredirect(True)
+                self._frameless_reassert()
                 self.root.geometry(geo)
                 self.root.attributes("-topmost", True)
                 self._set_taskbar_button()   # withdraw→deiconify dropped the button; bring it back
@@ -3040,9 +3218,13 @@ class Overlay:
         else:
             self.add_sys("🙈 Overlay hidden from screen shares again — private (only you can see it).")
 
-    def reset(self):
+    def _wipe_chat(self):
+        """Tear down the on-screen conversation + all per-turn state, WITHOUT telling the
+        worker what to do next. Shared by reset() (→ new session) and _load_conversation()
+        (→ resume a prior session): both start from a clean chat, they differ only in the
+        worker command that follows."""
         # Interrupt any in-flight turn FIRST. Otherwise the worker is blocked in
-        # receive_response() and the reset just queues behind it — meanwhile the tail
+        # receive_response() and the command just queues behind it — meanwhile the tail
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
@@ -3054,12 +3236,10 @@ class Overlay:
         self._claude_header = False
         self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
-        # async reset (close + reconnect) runs; the new session's true baseline arrives via the
+        # async close + reconnect runs; the new/resumed session's baseline arrives via the
         # worker's post-_open _emit_usage.
         self._ctx_pct = None
         self._refresh_statusline()
-        self.worker.reset()
-        self._set_status("resetting…")
         # Chat was just wiped — drop the compaction banner/timer so a stray result line
         # can't land in the fresh conversation (the worker's interrupt above ends the turn).
         if self._compacting:
@@ -3077,6 +3257,114 @@ class Overlay:
                 self.chat.mark_unset("compact_ln")   # chat was wiped; drop the dangling mark
             except Exception:
                 pass
+
+    def reset(self):
+        self._wipe_chat()
+        self.worker.reset()
+        self._set_status("resetting…")
+
+    # ── load / resume a prior conversation ──
+    def _render_history_assistant(self, text):
+        """Replay one assistant turn from a loaded transcript. Rendered as a plain Claude
+        block (header + text) rather than through the streaming markdown pipeline: loaded
+        history is for reference — the real context is restored server-side by resume — so
+        this stays simple and can't corrupt the live-streaming md state."""
+        try:
+            self.chat.insert("end", "\nClaude\n", ("ah",))
+            self.chat.insert("end", text.rstrip() + "\n", ("a",))
+        except tk.TclError:
+            pass
+
+    def _load_conversation(self, conv):
+        """Wipe the chat, replay a prior session's turns on screen, and tell the worker to
+        RESUME that session so continued messages keep its full context. `conv` is a
+        conversations.list_conversations() entry ({'id','path','title',...})."""
+        import conversations
+        self._wipe_chat()
+        try:
+            turns = conversations.load_transcript(conv["path"])
+        except Exception:
+            turns = []
+        for t in turns:
+            if t["role"] == "user":
+                self.add_user(t["text"])
+            else:
+                self._render_history_assistant(t["text"])
+        title = conv.get("title") or "conversation"
+        self.add_sys(f"↩ Loaded “{title}” — continuing where you left off.")
+        self.worker.resume(conv["id"])
+        self._set_status("loading…")
+
+    def _open_conv_picker(self):
+        """Popup a themed list of this project's past conversations; selecting one resumes it.
+        Also offers 'New conversation'. Best-effort: never raises into the caller."""
+        try:
+            import conversations, time as _time
+            convs = conversations.list_conversations(WORKING_DIR)
+        except Exception as e:
+            self.add_sys(f"(couldn't list conversations: {e})")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Conversations")
+        win.configure(bg=T["bg"])
+        win.transient(self.root)
+        win.geometry(f"{self.px(460)}x{self.px(420)}")
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        tk.Label(win, text="Resume a conversation", bg=T["bg"], fg=T["text"],
+                 font=self.f_title, anchor="w").pack(fill="x", padx=self.px(14), pady=(self.px(12), self.px(4)))
+
+        def _pick_new():
+            win.destroy()
+            self.reset()
+        tk.Button(win, text="＋  New conversation", command=_pick_new, anchor="w",
+                  bg=T["field"], fg=T["text"], activebackground=T["accent"],
+                  activeforeground=T["on_accent"], relief="flat", bd=0,
+                  highlightthickness=0, font=self.f_small).pack(
+                      fill="x", padx=self.px(14), pady=(0, self.px(8)))
+
+        if not convs:
+            tk.Label(win, text="No past conversations for this folder yet.", bg=T["bg"],
+                     fg=T["muted"], font=self.f_small).pack(padx=self.px(14), pady=self.px(10))
+            self._mac_activate()
+            return
+
+        frame = tk.Frame(win, bg=T["bg"]); frame.pack(fill="both", expand=True,
+                                                      padx=self.px(8), pady=(0, self.px(10)))
+        lb = tk.Listbox(frame, bg=T["field"], fg=T["text"], bd=0, highlightthickness=0,
+                        activestyle="none", selectbackground=T["accent"],
+                        selectforeground=T["on_accent"], font=self.f_small)
+        sb = tk.Scrollbar(frame, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y"); lb.pack(side="left", fill="both", expand=True)
+        now = _time.time()
+        for c in convs:
+            lb.insert("end", f"  {conversations.rel_time(c['mtime'], now):>8}  ·  "
+                             f"{c['turns']:>2} turns  ·  {c['title']}")
+        lb.selection_set(0)
+
+        def _pick_selected(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            conv = convs[sel[0]]
+            win.destroy()
+            self._load_conversation(conv)
+        lb.bind("<Double-Button-1>", _pick_selected)
+        lb.bind("<Return>", _pick_selected)
+
+        btns = tk.Frame(win, bg=T["bg"]); btns.pack(fill="x", padx=self.px(14), pady=(0, self.px(12)))
+        tk.Button(btns, text="Load", command=_pick_selected, bg=T["accent"], fg=T["on_accent"],
+                  activebackground=T["accent"], activeforeground=T["on_accent"], relief="flat",
+                  bd=0, highlightthickness=0, font=self.f_small).pack(side="right")
+        tk.Button(btns, text="Cancel", command=win.destroy, bg=T["field"], fg=T["muted"],
+                  activebackground=T["field"], relief="flat", bd=0, highlightthickness=0,
+                  font=self.f_small).pack(side="right", padx=(0, self.px(8)))
+        self._mac_activate()      # make sure the picker (and its keyboard) is frontmost on macOS
+        lb.focus_set()
 
     def compact_now(self):
         """Summarize the conversation so far to free up context (the CLI's /compact)."""
@@ -3142,6 +3430,17 @@ class Overlay:
 
     # ── visibility (hotkey) ──
     def _register_hotkey(self):
+        # The `keyboard` library's global hook only works on Windows (and Linux) as an
+        # unprivileged user. On macOS it spawns a listener thread that raises
+        # asynchronously ("Error 13 - Must be run as administrator") — the try/except here
+        # can't catch a background-thread failure, and it can't work without running as
+        # root anyway. So skip it off Windows and just note it; the overlay is summoned by
+        # clicking its window/orb instead.
+        if sys.platform != "win32":
+            self._keyboard = None
+            self.root.after(300, lambda: self.add_sys(
+                f"(global hotkey {HOTKEY} is Windows-only; click the overlay to summon it)"))
+            return
         try:
             import keyboard
             keyboard.add_hotkey(HOTKEY, self._hotkey_fired)
@@ -3155,11 +3454,12 @@ class Overlay:
 
     def _show_window(self):
         self.root.deiconify()
-        self.root.overrideredirect(True)
+        self._frameless_reassert()
         self.root.attributes("-topmost", True)
         self._set_taskbar_button()   # re-assert the taskbar button after a hotkey-hide → show
         self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
         self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
+        self._mac_activate(focus_entry=True)   # macOS: make the app active so typing lands here
         self.root.after(60, self._apply_region)
         self.visible = True
 
@@ -3453,6 +3753,13 @@ class Overlay:
             # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
             # post-_open _emit_usage has (just before this) pushed the NEW session's real
             # baseline. Nulling now would discard that correct value and leave a bare "—".
+            self._refresh_statusline()
+            self._set_busy(False)
+        elif kind == "resumed":
+            # A prior session finished (re)connecting with its history loaded. The on-screen
+            # replay + "Loaded …" line were already emitted by _load_conversation; just clear
+            # the "loading…" status and refresh the (now resumed) usage baseline.
+            self._set_status("")
             self._refresh_statusline()
             self._set_busy(False)
         elif kind == "delta":

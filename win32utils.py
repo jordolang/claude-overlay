@@ -12,6 +12,14 @@ import sys
 
 from config import TASKBAR_BUTTON, APP_ID, APP_ICON
 
+# On non-Windows (e.g. macOS) there is no ctypes.windll and no WINFUNCTYPE, and the
+# Win32 window-management / taskbar / capture-affinity features have no equivalent.
+# Every function below is written to degrade to a safe no-op on such platforms so the
+# overlay still runs: Tk provides the frameless/always-on-top window and Pillow provides
+# full-screen capture, and the Windows-only polish (rounded region, taskbar identity,
+# per-window capture, capture-exclusion) is simply skipped.
+IS_WIN = sys.platform == "win32"
+
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 def set_dpi_awareness():
@@ -300,7 +308,20 @@ def relaunch_overlay(script_path):
 
 
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.
-_gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
+if IS_WIN:
+    _gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
+else:
+    class _NoWin:
+        """Stand-in for user32/gdi32 off Windows: any attribute is a callable that
+        accepts anything and returns 0 (falsy). So the overlay's best-effort Win32
+        calls (SetWindowRgn, SetWindowPos, SetWindowDisplayAffinity, GetAncestor, …)
+        become harmless no-ops — `GetAncestor(...) or winfo_id()` falls through to the
+        Tk handle, region/affinity calls report failure so the caller uses its Tk /
+        withdraw fallback. The `.argtypes`/`.restype` assignments below land on throwaway
+        lambdas and are simply discarded."""
+        def __getattr__(self, name):
+            return lambda *a, **k: 0
+    _gdi32 = _user32 = _NoWin()
 _gdi32.CreateRoundRectRgn.restype = wt.HRGN
 _gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
 _user32.SetWindowRgn.restype = ctypes.c_int
@@ -322,7 +343,7 @@ _gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
 _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _user32.GetMonitorInfoW.restype = ctypes.c_int
 _MONENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-                                  ctypes.POINTER(wt.RECT), ctypes.c_void_p)
+                                  ctypes.POINTER(wt.RECT), ctypes.c_void_p) if IS_WIN else None
 _user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _MONENUMPROC, ctypes.c_void_p]
 _user32.EnumDisplayMonitors.restype = ctypes.c_int
 _user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, ctypes.c_uint]
@@ -390,7 +411,12 @@ class _MONITORINFO(ctypes.Structure):
 def enumerate_monitors():
     """Return [{'rect': (l,t,r,b), 'work': (l,t,r,b), 'primary': bool}, ...], primary first.
     'rect' is the full monitor; 'work' is the work area (excludes the taskbar) — used to place
-    a stranded window somewhere clickable rather than under the taskbar."""
+    a stranded window somewhere clickable rather than under the taskbar.
+
+    Off Windows: return [] — the caller (capture()) then does a single full-screen
+    ImageGrab.grab(), which Pillow handles correctly on macOS (all displays, Retina)."""
+    if not IS_WIN:
+        return []
     mons = []
 
     def _cb(hmon, hdc, lprc, lparam):
@@ -416,6 +442,8 @@ def virtual_screen_metrics():
     """(x, y, w, h) bounding box of the whole virtual desktop (all monitors combined), or None.
     Cheap (4 GetSystemMetrics calls) so it's usable as a per-poll display-topology signature:
     the box changes when a monitor is plugged/unplugged or a resolution changes."""
+    if not IS_WIN:
+        return None
     try:
         g = _user32.GetSystemMetrics
         return (g(SM_XVIRTUALSCREEN), g(SM_YVIRTUALSCREEN),
@@ -442,8 +470,11 @@ _user32.GetWindowTextW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
 _user32.GetWindowTextW.restype = ctypes.c_int
 _user32.GetShellWindow.restype = wt.HWND
 _user32.GetDesktopWindow.restype = wt.HWND
-_kernel32 = ctypes.windll.kernel32
-_kernel32.GetCurrentProcessId.restype = wt.DWORD
+if IS_WIN:
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.GetCurrentProcessId.restype = wt.DWORD
+else:
+    _kernel32 = None
 GA_ROOT = 2
 # DWMWA_EXTENDED_FRAME_BOUNDS is the window's VISIBLE frame — unlike GetWindowRect it
 # excludes the drop shadow and the invisible resize borders, so the capture doesn't
@@ -461,6 +492,8 @@ except Exception:
 def window_is_own(hwnd):
     """True when the window belongs to THIS process (the overlay itself — including the
     collapsed orb): never a capture target, we want what the user is working in."""
+    if not IS_WIN:
+        return True
     try:
         pid = wt.DWORD(0)
         tid = _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) if hwnd else 0
@@ -474,6 +507,8 @@ def window_is_own(hwnd):
 def window_capturable(hwnd):
     """A window that still makes sense to screenshot: exists, visible, not minimized
     (a minimized window's rect is a meaningless off-screen stub)."""
+    if not IS_WIN:
+        return False
     try:
         return bool(hwnd and _user32.IsWindow(hwnd) and _user32.IsWindowVisible(hwnd)
                     and not _user32.IsIconic(hwnd))
@@ -485,7 +520,11 @@ def foreground_capture_window():
     """The top-level foreground window as a capture target, or None when the foreground
     is unusable: this process (the user is typing in the overlay), the desktop/shell
     (nothing focused), or a window that's gone/minimized. The caller falls back to the
-    last tracked external window, then to full-screen capture."""
+    last tracked external window, then to full-screen capture.
+
+    Off Windows: return None so 'window'-scope capture falls back to full-screen."""
+    if not IS_WIN:
+        return None
     try:
         fg = _user32.GetForegroundWindow()
         if not fg:
@@ -502,6 +541,8 @@ def foreground_capture_window():
 
 def window_title(hwnd):
     """The window's title bar text ('' on failure) — labels the shot for the model."""
+    if not IS_WIN:
+        return ""
     try:
         n = _user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -533,6 +574,8 @@ def window_bbox(hwnd):
     """Screen-space (l,t,r,b) of a window suitable for ImageGrab(all_screens=True):
     DWM extended frame bounds (visible frame, no shadow) with GetWindowRect as the
     fallback, clipped to the virtual desktop. None when it can't be determined."""
+    if not IS_WIN:
+        return None
     rect = None
     if _dwmapi is not None:
         rc = wt.RECT()
