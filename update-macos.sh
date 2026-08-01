@@ -152,8 +152,9 @@ say "[OK] Compiles, and the macOS port + fork features are intact."
 
 # The full suite runs for INFORMATION only — it never decides anything (see above).
 if [ -n "$PY" ] && "$PY" -c "import pytest" >/dev/null 2>&1; then
-  SUMMARY="$("$PY" -m pytest tests/ -q -p no:cacheprovider 2>&1 | tail -1)"
-  say "     Full suite: $SUMMARY"
+  SUMMARY="$("$PY" -m pytest tests/ -p no:cacheprovider 2>&1 \
+             | grep -Eo '[0-9]+ (passed|failed)[^=]*' | tail -1)"
+  say "     Full suite: ${SUMMARY:-(could not run)}"
   say "     (test_copy_btn_puts_text_on_clipboard fails on macOS for environmental"
   say "      reasons — Tk clipboard ownership — and is expected.)"
 fi
