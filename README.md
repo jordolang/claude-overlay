@@ -47,6 +47,10 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   edits files, runs commands, and can even reach into the app on your screen (say,
   fix the wording on your open slide, or build a model in your open Excel), not just
   answer questions.
+- 🔁 **Conversations survive restarts.** Relaunch the overlay (say, after an update)
+  and it offers a one-click **Resume last conversation** — and if the connection to
+  the CLI drops mid-session, it reconnects *into the same conversation* instead of
+  losing your context.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots *and* pasted images.** It grabs your screen automatically on every
   message, or paste any image with **Ctrl+V** to ask about it.
@@ -231,7 +235,9 @@ git pull
 
 > **Then restart the overlay.** It's a long-running process and does **not** reload
 > while running — close it and re-open **`Start Claude Overlay.cmd`** for the update to
-> take effect. (On a managed/enterprise machine, updating is what fixes the older
+> take effect. Your conversation isn't lost: the relaunch offers a one-click
+> **↺ Resume last conversation**, and Claude picks up right where you left off.
+> (On a managed/enterprise machine, updating is what fixes the older
 > versions that could hang on the first tool call.)
 >
 > Updated **by hand** (`git pull`) and the Desktop icon still looks old? Re-run
@@ -292,7 +298,40 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 
 ## Configuration
 
-All settings are constants at the top of `claude_overlay.py`:
+All settings live as constants at the top of `config.py` — but **you don't have to edit
+the file**. Put personal values in a small per-machine **`config.json`** instead, so your
+setup survives every update with no `git pull` conflicts:
+
+```
+%LOCALAPPDATA%\claude-overlay\config.json
+```
+
+(the same folder that already remembers your toggles). List only the settings you want
+to change, using the constant names below — for example:
+
+```json
+{
+  "PERMISSION_MODE": "plan",
+  "THEME": "dark",
+  "WORKING_DIR": "C:\\Users\\you\\Documents"
+}
+```
+
+Overridable: `WORKING_DIR`, `MODEL`, `PERMISSION_MODE`, `SKILLS`, `STRICT_MCP_CONFIG`,
+`CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`, `SHOT_FORMAT`,
+`SHOT_JPEG_QUALITY`, `HIDE_SCREENSHOT_TOOL`, `THEME`, `SHOW_IN_SCREEN_SHARE_DEFAULT`,
+`TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`, `CORNER_RADIUS`, `ORB_SIZE`,
+`FONT_SANS` / `FONT_SERIF` / `FONT_MONO`.
+
+Precedence, weakest to strongest: the constants in `config.py` < `config.json` < an
+explicitly set `CLAUDE_OVERLAY_*` env var — and the remembered ⚙-toggle state
+(Window-only / Read-only) still wins over all three, exactly as it does over the
+constants: `SHOT_SCOPE` and `PERMISSION_MODE` from the file only seed the first launch.
+A typo'd key or wrong-typed value is skipped (never fatal) and called out in-chat at
+startup, so a mistake can't silently launch a misconfigured session. To keep the file
+somewhere else, point the `CLAUDE_OVERLAY_CONFIG` env var at it.
+
+The settings themselves:
 
 - `MODEL` — defaults to `"opus"`, a **family alias for the latest Opus**, so a future
   Opus release is adopted automatically. Use `"opus[1m]"` for the 1M-context variant, or
@@ -327,6 +366,15 @@ All settings are constants at the top of `claude_overlay.py`:
   "active" means the window you were working in before it (tracked automatically), and
   when no usable window exists (fresh launch, desktop focused, window minimized) it
   falls back to full-screen capture rather than sending nothing.
+- `RESUME_OFFER` (or the `CLAUDE_OVERLAY_RESUME_OFFER` env var) — on launch, offer a
+  one-click **↺ Resume last conversation** when the previous run left one behind (the
+  session id is remembered per completed turn; **Clear** wipes it, so a discarded
+  conversation is never offered back). `RESUME_OFFER_MAX_AGE` bounds how old a
+  conversation may be to qualify (default 7 days). The transcript isn't replayed —
+  Claude just remembers the context and you keep going. Note the overlay resumes the
+  session **it** recorded, not "the latest conversation in this directory" — if you
+  continue that session elsewhere (the CLI or Desktop) afterward, resume still loads its
+  newest state, but the "from … ago" label is measured from the overlay's last turn.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 

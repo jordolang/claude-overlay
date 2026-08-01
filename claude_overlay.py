@@ -188,6 +188,18 @@ class Overlay:
         self._update_available = None     # set to the newer version string if one exists
         self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
         self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
+        self._session_id = None           # the CLI's id for the current conversation (worker
+                                          # events); persisted per completed turn so the NEXT
+                                          # launch can offer to resume — see _persist_session
+        self._resume_btn = None           # the in-chat "Resume last conversation" button while
+                                          # it's still actionable, so events can restyle it
+        self._replayed_resume = False     # set by the conversation picker, which paints the old
+                                          # turns itself; tells the 'resumed' handler to skip the
+                                          # "transcript isn't replayed here" line (it just was)
+        self._discard_pending = False     # True from a Clear click until the worker's reset_done
+                                          # drains: a turn's (session / turn_done) batch already
+                                          # queued before the click must not re-set _session_id or
+                                          # re-persist the record and resurrect the discarded chat
         self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
@@ -426,6 +438,15 @@ class Overlay:
         # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
         # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
         self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
+        # Status-bar icon font: the native Windows symbol face renders a crisp, monochrome
+        # settings gear (U+E713 — the same glyph Windows uses in its own Settings UI) that
+        # colors cleanly with the theme, far nicer than the thin U+2699 the body font makes.
+        # Falls back to that plain glyph if neither Windows icon font is present.
+        _icon_fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in avail), None)
+        if _icon_fam:
+            self.f_icon, self.gear_glyph = mk(_icon_fam, 13), "\uE713"
+        else:
+            self.f_icon, self.gear_glyph = self.f_small, "⚙"
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -445,6 +466,12 @@ class Overlay:
                          "Read-only toggle off for full access." if self.read_only else
                          "⚡ Full access restored from your last session (you had "
                          "switched Read-only off). Flip it back on any time.")
+        # Anything the per-machine config.json couldn't apply (typo'd key, wrong type,
+        # unreadable file) must be SEEN — a silently-skipped PERMISSION_MODE would
+        # launch a full-access session the user believed was read-only.
+        for w in USER_CONFIG_WARNINGS:
+            self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
+        self._maybe_offer_resume()
 
         self.root.after(130, self._initial_focus)
         self.root.bind("<Configure>", self._on_configure)
@@ -1068,7 +1095,7 @@ class Overlay:
         # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
         # The gear turns the accent color while Read-only is ON, so that safety state stays
         # visible at a glance without opening the menu.
-        self.gear = tk.Label(st, text="⚙", bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.gear = tk.Label(st, text=self.gear_glyph, bg=T["bg"], font=self.f_icon, cursor="hand2")
         self.gear.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
         self.gear.bind("<Button-1>", self._gear_menu)
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
@@ -2705,6 +2732,119 @@ class Overlay:
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
+    def _maybe_offer_resume(self):
+        """On launch, if the previous run left a conversation behind (its session id is
+        persisted on every completed turn — see _persist_session), drop a one-click
+        Resume button into the chat. Only for a session from the SAME working dir (the
+        CLI stores sessions per directory) and not too old; Clear wipes the record, so
+        a deliberately discarded conversation is never offered back."""
+        if not RESUME_OFFER:
+            return
+        saved = _load_state().get("last_session")
+        if not (isinstance(saved, dict) and saved.get("id")):
+            return
+        if saved.get("cwd") != WORKING_DIR:
+            return
+        ts = saved.get("ts")
+        age = (time.time() - ts) if isinstance(ts, (int, float)) else -1
+        if not (0 <= age <= RESUME_OFFER_MAX_AGE):
+            return
+        self.add_sys(f"💬 You have a conversation from {self._age_str(age)} ago. "
+                     "Claude can pick it up where you left off:")
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._resume_btn_widget(str(saved["id"])),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+
+    @staticmethod
+    def _age_str(secs):
+        """Coarse '5 min' / '3 h' / '2 d' for the resume offer — false precision would
+        just be noise."""
+        secs = max(0, int(secs))
+        if secs < 3600:
+            return f"{max(1, secs // 60)} min"
+        if secs < 86400:
+            return f"{secs // 3600} h"
+        return f"{secs // 86400} d"
+
+    def _resume_btn_widget(self, session_id):
+        """One-click 'Resume last conversation' button embedded in the chat (same
+        embedded-canvas pattern as the CLI-update button, incl. the forwarded wheel).
+        Click asks the worker to relaunch the client with --resume; the outcome comes
+        back as a ('resumed') / ('resume_failed') event that restyles this exact
+        button. Once a NEW conversation starts (first send), the button goes stale —
+        clicking it then would silently discard the messages just exchanged."""
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2",
+                      takefocus=0)
+        c._ustate = "idle"                          # idle | working | done | failed | stale
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}  # current-zoom font + box, set by render()
+        labels = {"idle": "↺  Resume last conversation",
+                  "working": "Resuming…",
+                  "done": "✓  Resumed — keep going",
+                  "failed": "⚠  Couldn't resume — this is a fresh session",
+                  "stale": "↺  (a new conversation has started)"}
+
+        def draw(hover=False):
+            c.delete("all")
+            s = c._ustate
+            if s == "idle":
+                bg = T["accent_hi"] if hover else T["accent"]
+                fg = T["on_accent"]
+            elif s == "failed":
+                bg, fg = T["tool_bg"], T["err"]
+            else:                                   # working / done / stale → inert grey
+                bg, fg = T["tool_bg"], T["muted"]
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=labels[c._ustate], fill=fg,
+                          font=st["f"], anchor="center")
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            c._overlay_fonts = [f]                               # keep a ref so Tk won't GC it
+            pad = self.px(11)
+            widest = max(f.measure(v) for v in labels.values())  # widest state → no reflow
+            st.update(f=f, h=self.px(24), rad=self.px(7), w=pad + widest + pad)
+            c.configure(width=st["w"], height=st["h"])
+            draw()
+
+        def set_state(s):
+            c._ustate = s
+            try:
+                c.configure(cursor="hand2" if s == "idle" else "arrow")
+                draw()
+            except Exception:
+                pass
+        c._set_ustate = set_state    # let the resumed/resume_failed handlers restyle it
+
+        def on_click(_e):
+            if c._ustate != "idle" or self.busy:
+                return "break"
+            set_state("working")
+            self._set_status("resuming last conversation…")
+            self.worker.resume(session_id)
+            return "break"
+        c._click = on_click          # a named handle so the routing is directly testable
+
+        render()
+        c.bind("<Enter>", lambda e: draw(hover=True))
+        c.bind("<Leave>", lambda e: draw(hover=False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)      # embedded widget must not swallow scroll
+        self._register_zoomable(c, render)
+        self._resume_btn = c
+        return c
+
+    def _persist_session(self):
+        """Record the current conversation's session id (+ when and where) so the next
+        launch can offer to resume it. Called per completed turn — cheap (a tiny JSON
+        write) and crash-safe: whatever the last finished turn was, that's resumable."""
+        if self._session_id:
+            _save_state(last_session={"id": self._session_id, "ts": time.time(),
+                                      "cwd": WORKING_DIR})
+
     def _show_cli_update_notice(self, info):
         """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
         most once per session (guarded), and only reached when cliupdate found the CLI behind."""
@@ -2905,6 +3045,12 @@ class Overlay:
         if n:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         self.add_user(label)
+        if self._resume_btn is not None:   # a NEW conversation is starting — resuming now
+            try:                           # would silently discard it; retire the offer
+                self._resume_btn._set_ustate("stale")
+            except Exception:
+                pass
+            self._resume_btn = None
         if IMAGE_INPUT == "inline":
             paths = [s["path"] for s in (shots or [])] + list(images)
             self.worker.ask(self._inline_text(text, shots, images), paths)
@@ -3240,6 +3386,17 @@ class Overlay:
         # worker's post-_open _emit_usage.
         self._ctx_pct = None
         self._refresh_statusline()
+        # Clear = deliberate discard: forget the session AND its persisted record, so
+        # the next launch can't offer to resume a conversation the user threw away.
+        self._session_id = None
+        self._resume_btn = None          # the embedded button was just wiped with the chat
+        # Guard the window until the worker confirms the reset (reset_done): a stale
+        # (session / turn_done) batch from the turn that was in flight when Clear was
+        # clicked would otherwise re-set _session_id and re-persist the discarded record.
+        self._discard_pending = True
+        _save_state(last_session=None)
+        self.worker.reset()
+        self._set_status("resetting…")
         # Chat was just wiped — drop the compaction banner/timer so a stray result line
         # can't land in the fresh conversation (the worker's interrupt above ends the turn).
         if self._compacting:
@@ -3292,6 +3449,8 @@ class Overlay:
                 self._render_history_assistant(t["text"])
         title = conv.get("title") or "conversation"
         self.add_sys(f"↩ Loaded “{title}” — continuing where you left off.")
+        self._replayed_resume = True   # the turns are already on screen (see the 'resumed' handler)
+        self._resume_btn = None        # _wipe_chat destroyed it; don't restyle a dead widget
         self.worker.resume(conv["id"])
         self._set_status("loading…")
 
@@ -3749,17 +3908,12 @@ class Overlay:
             self.busy_lbl.configure(text="")
             self._refresh_statusline()
         elif kind == "reset_done":
+            self._discard_pending = False   # worker confirmed the wipe: stale events, if any,
+                                            # have drained ahead of this; the new session is live
             self.add_sys("🔄 new conversation.")
             # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
             # post-_open _emit_usage has (just before this) pushed the NEW session's real
             # baseline. Nulling now would discard that correct value and leave a bare "—".
-            self._refresh_statusline()
-            self._set_busy(False)
-        elif kind == "resumed":
-            # A prior session finished (re)connecting with its history loaded. The on-screen
-            # replay + "Loaded …" line were already emitted by _load_conversation; just clear
-            # the "loading…" status and refresh the (now resumed) usage baseline.
-            self._set_status("")
             self._refresh_statusline()
             self._set_busy(False)
         elif kind == "delta":
@@ -3779,6 +3933,61 @@ class Overlay:
             self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
             self._maybe_flag_done()      # badge the orb if this finished while collapsed
+            if not self._discard_pending:
+                self._persist_session()  # this conversation is now the resumable one
+                                         # (skipped for a turn Cleared mid-flight)
+        elif kind == "session":
+            if not self._discard_pending:   # ignore a stale id from a Cleared conversation
+                self._session_id = str(payload)
+        elif kind == "resumed":
+            self._set_status("")
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("done")
+                except Exception:
+                    pass
+                self._resume_btn = None
+            # Two paths land here: the launch-time Resume button (no on-screen history, so
+            # say the transcript isn't replayed) and the conversation picker, which already
+            # replayed the turns and printed its own "Loaded …" line — repeating the
+            # not-replayed wording there would contradict what the user is looking at.
+            if self._replayed_resume:
+                self._replayed_resume = False
+            else:
+                self.add_sys("↺ Resumed your last conversation. The transcript isn't "
+                             "replayed here, but Claude remembers it — just keep going.")
+            self._refresh_statusline()   # the resumed session's usage baseline
+            self._set_busy(False)
+            self._persist_session()      # keep it resumable even if no new turn follows
+        elif kind == "resume_failed":
+            self._set_status("")
+            self._replayed_resume = False   # this attempt is over; don't let a stale True
+                                            # silence the message on the NEXT resume
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("failed")
+                except Exception:
+                    pass
+                self._resume_btn = None
+            else:
+                # The offer was already retired (a send or Clear raced the resume outcome),
+                # so the button can't carry the news. Say it in the chat, or the fallback to
+                # a fresh session would be completely silent — the one thing this feature is
+                # meant not to do.
+                self.add_sys("↺ Couldn't resume the previous conversation — this is a "
+                             "fresh session.")
+        elif kind == "resume_lost":
+            # The connect looked like a resume, but the CLI's first streamed id proves it
+            # silently started FRESH (see worker._set_session). Correct the earlier
+            # optimistic "resumed" so the user isn't told the context is back when it isn't.
+            self.add_err("⚠ The previous conversation couldn't be restored after all — the "
+                         "CLI started a fresh session, so earlier context isn't available.")
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("failed")
+                except Exception:
+                    pass
+                self._resume_btn = None
         elif kind == "compacting":
             self._start_compact_anim()
         elif kind == "compact_done":

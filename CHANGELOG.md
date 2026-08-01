@@ -3,6 +3,61 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.14.0] — 2026-07-23
+
+### Added
+- **Conversations survive restarts.** The overlay remembers the CLI session id of your
+  current conversation (per completed turn, in the same per-machine `state.json` as the
+  toggles), and the next launch offers a one-click **↺ Resume last conversation** button
+  in the chat — the transcript isn't replayed, but Claude remembers everything, so you
+  just keep going. Closing the overlay to update it no longer costs you your context.
+  Offered only for a session from the same working directory, younger than
+  `RESUME_OFFER_MAX_AGE` (7 days); **Clear wipes the record**, so a deliberately
+  discarded conversation is never offered back. If the session file is gone, the click
+  falls back to a fresh session with a notice. Set `RESUME_OFFER = False` (or
+  `CLAUDE_OVERLAY_RESUME_OFFER=0`) to never offer. Thanks @l8w8!
+
+### Fixed
+- **A transport drop mid-session no longer loses the conversation.** The
+  "↻ Connection hiccup" recovery path used to reconnect with a *fresh* session —
+  silently discarding all context. It now reconnects with `--resume` into the same
+  conversation; only a failed resume falls back to a fresh session (and says so).
+
+## [1.13.0] — 2026-07-23
+
+### Added
+- **Personal settings now live in a per-machine `config.json` — no more editing
+  `config.py`.** Drop the settings you want to change (e.g. `{"PERMISSION_MODE":
+  "plan", "THEME": "dark"}`) into `%LOCALAPPDATA%\claude-overlay\config.json` (or any
+  path via the `CLAUDE_OVERLAY_CONFIG` env var) and they override the committed
+  defaults at startup — so a customized setup survives every `git pull` / `update.cmd`
+  with no conflicts. Precedence: constants < `config.json` < an explicitly set
+  `CLAUDE_OVERLAY_*` env var, and the remembered ⚙-toggle state still wins over all
+  three, exactly as before. Values are validated against a whitelist; anything typo'd,
+  wrong-typed, or unknown is skipped and called out in-chat at startup — a mistake in
+  the file can never silently launch a misconfigured (say, full-access) session, and a
+  broken file degrades to the defaults instead of preventing launch. A misspelled key
+  suggests the setting you probably meant, and an invalid value is still flagged even
+  when an env var happens to shadow it. See the README's **Configuration** section for
+  the full list of overridable settings. Thanks @l8w8!
+
+## [1.12.2] — 2026-07-16
+
+### Fixed
+- **Turning the Read-only lock back off no longer errors on machines where
+  `bypassPermissions` is disabled by policy.** If your Claude configuration disables bypass
+  mode (common on managed/enterprise setups), the overlay silently launches in a degraded
+  mode but still believed it could return to `bypassPermissions` at run time — so flipping
+  Read-only off failed with *"Cannot set permission mode to bypassPermissions because it is
+  disabled by settings or configuration"*. It now falls back to `acceptEdits` (the same
+  effective full access here, since the overlay auto-approves prompts) instead of erroring,
+  and remembers bypass is unreachable so it won't try again.
+
+### Changed
+- **The ⚙ settings-menu icon is now the crisp native Windows settings glyph** (Segoe Fluent
+  Icons / MDL2 Assets) instead of the thin, awkward `⚙` character, so it reads cleanly in
+  the status bar. Falls back to the plain glyph if those fonts aren't present.
+
 ## [1.12.1] — 2026-07-16
 
 ### Changed
@@ -734,6 +789,9 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.14.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.14.0
+[1.13.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.13.0
+[1.12.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.2
 [1.12.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.1
 [1.12.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.0
 [1.11.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.4

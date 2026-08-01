@@ -15,8 +15,16 @@ shown: no flash, no focus steal). Skips cleanly if Tk has no display.
 import os
 import queue
 import sys
+import tempfile
 
 import pytest
+
+# Isolate the whole suite from THIS machine's personal config.json overrides: the unit
+# tests assert the COMMITTED defaults, and the UI suite must not inherit a personal
+# theme/permission mode. Point the override loader at a path that can't exist — set
+# BEFORE the first `import config` anywhere (conftest imports before test modules).
+os.environ["CLAUDE_OVERLAY_CONFIG"] = os.path.join(
+    tempfile.gettempdir(), "claude_overlay_test_no_user_config", "config.json")
 
 # Belt-and-suspenders for the one Tk init (and any stray second root): pin the Tcl/Tk
 # library dirs so the interpreter always finds them.
@@ -48,6 +56,7 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def resume(self, *a):       self._rec("resume", *a)
     def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
@@ -126,6 +135,8 @@ def _clean_overlay(ov):
     ov.pending_images = []
     ov.pending_shot = None
     ov._precaptured = None
+    ov._discard_pending = False         # reset() sets it True; a real run clears it on the
+                                        # worker's reset_done, which the fixture never delivers
     ov._capture_busy = False
     ov._paste_busy = False
     ov._send_hover = False
