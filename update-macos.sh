@@ -98,6 +98,11 @@ PY=""
 if [ -x ".venv/bin/python" ]; then PY=".venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then PY="python3"; fi
 if [ -n "$PY" ]; then
+  # Pin the current versions FIRST: if the verify step rolls the code back, the packages
+  # have to come back with it, or you end up on old code running a newer SDK — which is
+  # its own broken state, and not one the rollback message would be telling the truth about.
+  PKGS_BEFORE="$("$PY" -m pip freeze 2>/dev/null \
+                 | grep -iE '^(claude-agent-sdk|pillow|keyboard)==' || true)"
   say "Refreshing Python packages using $PY..."
   "$PY" -m pip install --upgrade --quiet claude-agent-sdk pillow keyboard \
     || say "[!] Package refresh failed - the code was still merged."
@@ -143,6 +148,14 @@ if [ -n "$FAILED" ]; then
   say "[!] This upstream release BREAKS the macOS port: $FAILED"
   say "    Rolling back to where you were."
   git reset --hard "$PRE" >/dev/null 2>&1
+  # The packages were upgraded above, so undo that too — otherwise "rolled back" would
+  # leave the OLD code running against the NEW SDK.
+  if [ -n "${PKGS_BEFORE:-}" ]; then
+    say "    Restoring the previous package versions..."
+    # shellcheck disable=SC2046  # word-splitting the pinned list is intended
+    "$PY" -m pip install --quiet $(printf '%s ' $PKGS_BEFORE) \
+      || say "[!] Package restore failed — check with: $PY -m pip list"
+  fi
   say "[OK] Rolled back to $(git rev-parse --short HEAD). Nothing is broken."
   say
   say "    Ask Claude Code:  \"merge origin/main into my macOS port\""
