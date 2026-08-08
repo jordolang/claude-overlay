@@ -4026,8 +4026,13 @@ class Overlay:
             self.add_sys(str(payload))
         elif kind == "update":
             self._update_available = str(payload)
+            # `update.cmd` is a Windows batch file — on macOS running it only gets you
+            # "command not found". And `git pull` is NOT the mac fallback: this clone
+            # carries the port as commits on top of upstream, so a pull fetches nothing
+            # and reports success. ./update-macos.sh merges origin/main instead.
+            how = "./update-macos.sh" if MAC else "update.cmd (or: git pull)"
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
-                         "Close the overlay and run update.cmd (or: git pull) to upgrade.")
+                         f"Close the overlay and run {how} to upgrade.")
             self._refresh_statusline()
         elif kind == "cli_update":
             self._show_cli_update_notice(payload)

@@ -17,6 +17,7 @@ was broken with no error anywhere. Conflict markers are easy to spot; that is no
 """
 import ast
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -224,3 +225,43 @@ def test_launcher_scripts_present():
         p = REPO / name
         assert p.exists(), f"{name} is missing"
         assert os.access(p, os.X_OK), f"{name} is not executable (chmod +x)"
+
+
+def test_user_facing_hints_never_send_mac_users_to_cmd_files():
+    """Upstream's error text names .cmd/.ps1 — dead ends on macOS.
+
+    `./update.cmd` is batch, so the shell just says "command not found"; the advice reads
+    as a fix and isn't one. The `git pull` fallback is worse than useless here: this clone
+    carries the port as commits on top of upstream, so a pull fetches nothing and reports
+    success (that's the whole reason update-macos.sh merges origin/main instead).
+
+    An upstream merge re-hardcoding those strings would silently undo the fix, so pin the
+    platform switch rather than the wording.
+    """
+    # worker.py resolves its hints at import, so assert the values the user actually sees
+    # rather than the source that produced them — reflowing the code can't defeat this.
+    if sys.platform == "darwin":
+        import worker
+        assert "update-macos.sh" in worker.UPDATE_HINT, \
+            "worker's update hint lost the macOS updater"
+        assert ".cmd" not in worker.UPDATE_HINT, \
+            "worker tells macOS users to run a Windows batch file"
+        assert ".ps1" not in worker.INSTALL_CLI_HINT and ".cmd" not in worker.INSTALL_CLI_HINT, \
+            "worker's CLI-install hint points macOS users at a PowerShell/batch script"
+
+    # The overlay builds its hint inline as `X if MAC else Y`, so it has to be read out of
+    # the source. Text-matching the line is no good — the Windows half names `git pull` on
+    # that same line, and the comment above it names both — so pull the mac branch out of
+    # the AST and assert on that alone.
+    src = (REPO / "claude_overlay.py").read_text(encoding="utf-8")
+    mac_branches = [
+        n.body.value for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.IfExp) and isinstance(n.body, ast.Constant)
+        and isinstance(n.body.value, str) and "update-macos.sh" in n.body.value
+    ]
+    assert mac_branches, "the update notice lost its `... if MAC else ...` macOS updater"
+    for hint in mac_branches:
+        assert "git pull" not in hint, \
+            "the macOS update hint offers `git pull`, which silently no-ops on this fork"
+        assert ".cmd" not in hint, \
+            "the macOS update hint names a Windows batch file"

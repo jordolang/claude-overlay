@@ -68,6 +68,16 @@ from config import *
 from debuglog import dbg, DEBUG_LOG, _UIQueueTap, _dbg_stream_last, _dbg_think_last
 from modelresolve import resolve_model
 
+# What to tell the user to run when they need to update/install. The .cmd/.ps1 answers are
+# Windows-only — on macOS `./update.cmd` is just "command not found", so error text that
+# names it is a dead end. Note the mac updater is NOT `git pull`: this clone carries the
+# port as commits on top of upstream, so it has to MERGE origin/main (see update-macos.sh).
+_MAC = sys.platform == "darwin"
+UPDATE_HINT = "./update-macos.sh" if _MAC else "update.cmd"
+INSTALL_CLI_HINT = ("install it with `curl -fsSL https://claude.ai/install.sh | bash`") \
+                   if _MAC else \
+                   ("run setup.cmd (or `irm https://claude.ai/install.ps1 | iex`)")
+
 class ClaudeWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue", permission_mode=None):
         super().__init__(daemon=True)
@@ -565,13 +575,13 @@ class ClaudeWorker(threading.Thread):
             elif isinstance(e, TypeError):   # ClaudeAgentOptions rejected a kwarg → SDK too old
                 self.ui.put(("error",
                     f"Your claude-agent-sdk looks too old ({type(e).__name__}: {e}). "
-                    "Update it:  pip install --upgrade claude-agent-sdk  (or run update.cmd)."))
+                    f"Update it:  pip install --upgrade claude-agent-sdk  (or run {UPDATE_HINT})."))
             else:
                 self.ui.put(("error",
                     f"Could not start Claude: {type(e).__name__}: {e}\n"
                     "Is the `claude` CLI installed and logged in? Run `claude --version` "
-                    "in a terminal; if it's missing, run setup.cmd (or `irm "
-                    "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
+                    f"in a terminal; if it's missing, {INSTALL_CLI_HINT}, then `claude` "
+                    "to /login."))
             return False
 
     @staticmethod
